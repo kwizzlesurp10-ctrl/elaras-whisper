@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Elara’s Whisper — The Glass Eye Unbound</title>
+  <meta name="description" content="Loosen machine-spun tracks with spectral breath, air, micro-dynamics, and gentle warmth." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%230a0b10' stroke='%23c9a227' stroke-width='2'/%3E%3Ccircle cx='32' cy='32' r='14' fill='%231a1d2e' stroke='%235eead4' stroke-width='1.5'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23c9a227'/%3E%3C/svg%3E" />
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="haze" aria-hidden="true"></div>
+
+  <header class="mast">
+    <p class="eyebrow">standalone audio loom</p>
+    <h1>Elara’s Whisper</h1>
+    <p class="subtitle"><em>The Glass Eye Unbound</em></p>
+    <p class="lede">
+      Softens machine-spun tracks — Suno exports and kin — without tearing
+      the memory of the making.
+    </p>
+  </header>
+
+  <main class="stage">
+    <!-- Left: drop lens -->
+    <section class="panel lens-panel" aria-label="Source tracks">
+      <div
+        id="dropzone"
+        class="dropzone"
+        tabindex="0"
+        role="button"
+        aria-label="Drop audio files or click to browse"
+      >
+        <div class="aperture">
+          <div class="iris-ring r1"></div>
+          <div class="iris-ring r2"></div>
+          <div class="iris-ring r3"></div>
+          <div class="pupil">
+            <span class="pupil-glow"></span>
+            <svg class="icon-wave" viewBox="0 0 48 24" aria-hidden="true">
+              <path d="M0 12 Q6 4 12 12 T24 12 T36 12 T48 12" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+          </div>
+        </div>
+        <p class="drop-title">Lay the track upon the glass</p>
+        <p class="drop-hint">Drop wav · flac · mp3 · ogg · aiff — or click to browse</p>
+        <input id="file-input" type="file" accept="audio/*,.wav,.flac,.mp3,.ogg,.aiff,.aif,.caf" multiple hidden />
+      </div>
+
+      <ul id="file-list" class="file-list" hidden></ul>
+
+      <div class="meta-row">
+        <label class="field">
+          <span>Memory seed</span>
+          <input id="seed" type="number" placeholder="optional" min="0" step="1" />
+        </label>
+        <label class="field">
+          <span>Haze from (Hz)</span>
+          <input id="haze" type="number" value="6000" min="1000" max="18000" step="100" />
+        </label>
+      </div>
+    </section>
+
+    <!-- Center: the dial -->
+    <section class="panel dial-panel" aria-label="Intensity dial">
+      <div class="dial-wrap">
+        <canvas id="eye-dial" width="360" height="360" role="slider"
+          aria-valuemin="0" aria-valuemax="1.2" aria-valuenow="0.45"
+          aria-label="Intensity dial" tabindex="0"></canvas>
+        <div class="dial-readout" aria-live="polite">
+          <span id="intensity-value">0.45</span>
+          <span id="intensity-name">recommended</span>
+        </div>
+      </div>
+
+      <div class="presets" id="presets" role="group" aria-label="Intensity presets">
+        <!-- filled by JS -->
+      </div>
+
+      <button id="whisper-btn" class="whisper-btn" type="button" disabled>
+        <span class="btn-orb"></span>
+        <span class="btn-label">Unbind the glass eye</span>
+      </button>
+
+      <p id="status" class="status" role="status"></p>
+    </section>
+
+    <!-- Right: stages + output -->
+    <section class="panel lore-panel" aria-label="Loom stages">
+      <h2 class="panel-title">The four breaths</h2>
+      <ol class="stages" id="stages">
+        <li data-stage="unstitch">
+          <span class="stage-mark">I</span>
+          <div>
+            <strong>Spectral unstitching</strong>
+            <p>Above the haze — magnitude breath, living phase jitter</p>
+          </div>
+        </li>
+        <li data-stage="air">
+          <span class="stage-mark">II</span>
+          <div>
+            <strong>Organic air</strong>
+            <p>High-frequency grain · room tone · tape whisper</p>
+          </div>
+        </li>
+        <li data-stage="dynamics">
+          <span class="stage-mark">III</span>
+          <div>
+            <strong>Micro-dynamics</strong>
+            <p>Non-uniform windows — hesitate, swell, recede</p>
+          </div>
+        </li>
+        <li data-stage="warmth">
+          <span class="stage-mark">IV</span>
+          <div>
+            <strong>Gentle warmth</strong>
+            <p>Soft analog bloom so transients breathe</p>
+          </div>
+        </li>
+      </ol>
+
+      <div class="intensity-guide">
+        <div class="guide-row"><span>0.0</span><span>pose untouched</span></div>
+        <div class="guide-row"><span>0.45</span><span>middle ground</span></div>
+        <div class="guide-row"><span>0.8+</span><span>grandmother fluffing the fur</span></div>
+      </div>
+
+      <div id="result" class="result" hidden>
+        <h2 class="panel-title">Softened</h2>
+        <a id="download-link" class="download" href="#" download>
+          <span>↓</span> Take the whispered track
+        </a>
+        <p id="result-meta" class="result-meta"></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>Elara’s Whisper · local loom · nothing leaves this machine</span>
+    <a href="https://github.com/kwizzlesurp10-ctrl/elaras-whisper" target="_blank" rel="noopener">source</a>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

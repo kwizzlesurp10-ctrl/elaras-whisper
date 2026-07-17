@@ -1,3 +1,12 @@
 __pycache__/
 *.pyc
 .DS_Store
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.venv/
+venv/
+elaras_whisper_out/
+*__elaras_whisper.*

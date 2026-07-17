@@ -16,13 +16,15 @@ One dial rules them all:
   0.45 — recommended middle ground (default)
   0.8+ — grandmother fluffing the fur
 
-Dependencies (already in the workshop):
+Dependencies:
   numpy, scipy, soundfile
 
 Usage:
   python elaras_whisper.py track.wav
   python elaras_whisper.py track.mp3 -i 0.45 -o softened.wav
   python elaras_whisper.py track.wav --intensity 0.6 --seed 42
+  python elaras_whisper.py a.wav b.wav -o out_dir/ --preset fluff
+  python elaras_whisper.py --batch ./suno_exports -i 0.45
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -45,6 +47,15 @@ N_FFT = 2048
 HOP = 512
 DEFAULT_INTENSITY = 0.45
 SUPPORTED_EXTS = {".wav", ".flac", ".ogg", ".aiff", ".aif", ".mp3", ".caf"}
+
+# Named intensity stops for A/B and muscle-memory
+PRESETS: Dict[str, float] = {
+    "pose": 0.0,  # bit-identical pass-through (after peak safety on write)
+    "breath": 0.25,  # light air only
+    "recommended": DEFAULT_INTENSITY,  # middle ground
+    "fluff": 0.80,  # heavier unstitch + grain
+    "grandmother": 1.0,  # full dial
+}
 
 
 # ---------------------------------------------------------------------------
@@ -378,10 +389,174 @@ def whisper(
 
 
 # ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def resolve_intensity(intensity: Optional[float], preset: Optional[str]) -> float:
+    """Preset wins when both are given; default is recommended intensity."""
+    if preset is not None:
+        key = preset.strip().lower()
+        if key not in PRESETS:
+            known = ", ".join(sorted(PRESETS))
+            raise ValueError(f"unknown preset {preset!r}; choose from: {known}")
+        return PRESETS[key]
+    if intensity is not None:
+        return float(intensity)
+    return DEFAULT_INTENSITY
+
+
+def collect_inputs(
+    paths: Sequence[Path],
+    batch_dirs: Sequence[Path],
+    recursive: bool = False,
+) -> List[Path]:
+    """Gather unique audio files from explicit paths and batch directories."""
+    found: List[Path] = []
+    seen: set = set()
+
+    def add_file(p: Path) -> None:
+        rp = p.expanduser().resolve()
+        if rp in seen:
+            return
+        seen.add(rp)
+        found.append(rp)
+
+    for raw in paths:
+        p = raw.expanduser().resolve()
+        if p.is_file():
+            add_file(p)
+        elif p.is_dir():
+            # Bare directory on the positional list is treated as a batch folder
+            pattern = "**/*" if recursive else "*"
+            for child in sorted(p.glob(pattern)):
+                if child.is_file() and child.suffix.lower() in SUPPORTED_EXTS:
+                    add_file(child)
+        else:
+            raise FileNotFoundError(f"input not found: {p}")
+
+    for d in batch_dirs:
+        root = d.expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"batch directory not found: {root}")
+        pattern = "**/*" if recursive else "*"
+        for child in sorted(root.glob(pattern)):
+            if child.is_file() and child.suffix.lower() in SUPPORTED_EXTS:
+                add_file(child)
+
+    return found
+
+
+def output_as_directory(
+    output: Optional[Path],
+    *,
+    multi: bool,
+    force_dir: bool = False,
+) -> bool:
+    """Decide whether -o names a directory (batch) or a single file."""
+    if multi or force_dir:
+        return True
+    if output is None:
+        return False
+    p = output.expanduser()
+    if p.is_dir():
+        return True
+    # Trailing separator signals directory intent even if path does not exist yet
+    if str(output).endswith(("/", "\\")):
+        return True
+    if p.is_file():
+        return False
+    # Known audio suffix → file target
+    if p.suffix.lower() in SUPPORTED_EXTS:
+        return False
+    # Bare name without suffix → directory
+    if not p.suffix:
+        return True
+    return False
+
+
+def resolve_output_path(
+    src: Path,
+    output: Optional[Path],
+    *,
+    as_directory: bool,
+) -> Path:
+    """
+    Single file: -o is a file path (or default stem suffix).
+    Batch/multi: -o is an output directory (created as needed).
+    """
+    if as_directory:
+        out_dir = (
+            output.expanduser().resolve()
+            if output
+            else (src.parent / "elaras_whisper_out")
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / f"{src.stem}__elaras_whisper{src.suffix or '.wav'}"
+
+    if output is not None:
+        return output.expanduser().resolve()
+    return default_output_path(src)
+
+
+def process_file(
+    src: Path,
+    out_path: Path,
+    intensity: float,
+    seed: Optional[int],
+    haze_hz: float,
+    quiet: bool = False,
+) -> int:
+    """Process one file. Returns 0 on success, 1 on failure."""
+    if src.suffix.lower() not in SUPPORTED_EXTS:
+        print(
+            f"warning: extension {src.suffix!r} may not be supported; attempting load…",
+            file=sys.stderr,
+        )
+
+    if not quiet:
+        print(f"  → {src.name}")
+
+    try:
+        audio, sr = load_audio(src)
+    except Exception as e:
+        print(f"error: could not read {src}: {e}", file=sys.stderr)
+        return 1
+
+    n_ch = audio.shape[1]
+    dur = audio.shape[0] / sr
+    if not quiet:
+        print(f"     loaded:  {dur:.2f}s · {sr} Hz · {n_ch} ch")
+
+    try:
+        result = whisper(
+            audio,
+            sr,
+            intensity=intensity,
+            seed=seed,
+            haze_hz=haze_hz,
+        )
+    except Exception as e:
+        print(f"error: processing failed for {src}: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save_audio(out_path, result, sr)
+    except Exception as e:
+        print(f"error: could not write {out_path}: {e}", file=sys.stderr)
+        return 1
+
+    if not quiet:
+        print(f"     written: {out_path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
+    preset_help = ", ".join(f"{k}={v:g}" for k, v in PRESETS.items())
     p = argparse.ArgumentParser(
         prog="elaras_whisper",
         description=(
@@ -395,26 +570,67 @@ def build_parser() -> argparse.ArgumentParser:
             "  0.0   pose untouched\n"
             "  0.45  recommended middle ground (default)\n"
             "  0.8+  grandmother fluffing the fur\n"
+            "\n"
+            f"presets: {preset_help}\n"
+            "\n"
+            "examples:\n"
+            "  elaras_whisper track.wav\n"
+            "  elaras_whisper track.mp3 -i 0.45 -o out.wav --seed 42\n"
+            "  elaras_whisper a.wav b.wav -o ./softened/\n"
+            "  elaras_whisper --batch ./suno_exports --preset fluff\n"
+            "  elaras_whisper --batch ./album -r -o ./album_whispered/\n"
+            "  elaras_whisper --gui\n"
         ),
     )
     p.add_argument(
-        "input",
+        "--gui",
+        action="store_true",
+        help="Open the Glass Eye local web UI (requires Flask)",
+    )
+    p.add_argument(
+        "inputs",
+        nargs="*",
         type=Path,
-        help="Source audio (wav/flac/ogg/mp3/aiff — any Suno export or kin)",
+        help="Source audio file(s) or folder(s) (wav/flac/ogg/mp3/aiff…)",
+    )
+    p.add_argument(
+        "--batch",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="DIR",
+        help="Process all supported audio in DIR (repeatable)",
+    )
+    p.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="With folders / --batch, walk subdirectories",
     )
     p.add_argument(
         "-o",
         "--output",
         type=Path,
         default=None,
-        help="Output path (default: <stem>__elaras_whisper.<ext>)",
+        help=(
+            "Output path: file for a single input, or directory for batch "
+            "(default: <stem>__elaras_whisper.<ext> / elaras_whisper_out/)"
+        ),
     )
     p.add_argument(
         "-i",
         "--intensity",
         type=float,
-        default=DEFAULT_INTENSITY,
+        default=None,
         help=f"Intensity dial 0.0–1.0+ (default: {DEFAULT_INTENSITY})",
+    )
+    p.add_argument(
+        "--preset",
+        type=str,
+        default=None,
+        metavar="NAME",
+        choices=sorted(PRESETS.keys()),
+        help=f"Named intensity stop ({preset_help})",
     )
     p.add_argument(
         "--seed",
@@ -428,67 +644,108 @@ def build_parser() -> argparse.ArgumentParser:
         default=HAZE_HZ,
         help=f"Frequency where spectral unstitching begins (default: {HAZE_HZ})",
     )
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Less console chatter",
+    )
+    p.add_argument(
+        "--list-presets",
+        action="store_true",
+        help="Print named presets and exit",
+    )
     return p
 
 
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
-    src: Path = args.input.expanduser().resolve()
 
-    if not src.is_file():
-        print(f"error: input not found: {src}", file=sys.stderr)
+    if args.list_presets:
+        for name, val in PRESETS.items():
+            mark = " (default)" if val == DEFAULT_INTENSITY else ""
+            print(f"  {name:12s}  {val:g}{mark}")
+        return 0
+
+    if args.gui:
+        try:
+            from elaras_whisper_ui import main as ui_main
+        except ImportError as e:
+            print(
+                "error: Glass Eye UI unavailable "
+                f"({e}). Install with: pip install flask   or   pip install -e '.[ui]'",
+                file=sys.stderr,
+            )
+            return 1
+        # Forward host/port if we ever add them; for now open browser by default
+        return ui_main(["--open"])
+
+    if not args.inputs and not args.batch:
+        build_parser().error("provide at least one input path, --batch DIR, or --gui")
+
+    try:
+        intensity = resolve_intensity(args.intensity, args.preset)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
         return 1
 
-    if src.suffix.lower() not in SUPPORTED_EXTS:
-        print(
-            f"warning: extension {src.suffix!r} may not be supported; attempting load…",
-            file=sys.stderr,
-        )
+    try:
+        sources = collect_inputs(args.inputs, args.batch, recursive=args.recursive)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
-    out_path = (
-        args.output.expanduser().resolve()
-        if args.output
-        else default_output_path(src)
+    if not sources:
+        print("error: no supported audio files found", file=sys.stderr)
+        return 1
+
+    multi = len(sources) > 1
+    # --batch always writes into a directory (even for a single match)
+    force_dir = bool(args.batch)
+    as_directory = output_as_directory(
+        args.output, multi=multi, force_dir=force_dir
     )
+    if as_directory and args.output is not None:
+        out = args.output.expanduser()
+        if out.is_file():
+            print(
+                "error: for batch/multi inputs, -o must be a directory, not a file",
+                file=sys.stderr,
+            )
+            return 1
 
-    print(f"Elara's Whisper — The Glass Eye Unbound")
-    print(f"  input:      {src}")
-    print(f"  intensity:  {args.intensity}")
-    if args.seed is not None:
-        print(f"  seed:       {args.seed}")
-    print(f"  haze from:  {args.haze_hz:.0f} Hz")
+    if not args.quiet:
+        print("Elara's Whisper — The Glass Eye Unbound")
+        print(f"  files:      {len(sources)}")
+        if args.preset:
+            print(f"  preset:     {args.preset} → intensity {intensity:g}")
+        else:
+            print(f"  intensity:  {intensity:g}")
+        if args.seed is not None:
+            print(f"  seed:       {args.seed}")
+        print(f"  haze from:  {args.haze_hz:.0f} Hz")
 
-    try:
-        audio, sr = load_audio(src)
-    except Exception as e:
-        print(f"error: could not read audio: {e}", file=sys.stderr)
-        return 1
-
-    n_ch = audio.shape[1]
-    dur = audio.shape[0] / sr
-    print(f"  loaded:     {dur:.2f}s · {sr} Hz · {n_ch} ch")
-
-    try:
-        result = whisper(
-            audio,
-            sr,
-            intensity=args.intensity,
+    failures = 0
+    for src in sources:
+        out_path = resolve_output_path(
+            src, args.output, as_directory=as_directory
+        )
+        rc = process_file(
+            src,
+            out_path,
+            intensity=intensity,
             seed=args.seed,
             haze_hz=float(args.haze_hz),
+            quiet=args.quiet,
         )
-    except Exception as e:
-        print(f"error: processing failed: {e}", file=sys.stderr)
-        return 1
+        failures += rc
 
-    try:
-        save_audio(out_path, result, sr)
-    except Exception as e:
-        print(f"error: could not write output: {e}", file=sys.stderr)
-        return 1
-
-    print(f"  written:    {out_path}")
-    print("  the glass eye softens.")
-    return 0
+    if not args.quiet:
+        if failures:
+            print(f"  done with {failures} failure(s).")
+        else:
+            print("  the glass eye softens.")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
