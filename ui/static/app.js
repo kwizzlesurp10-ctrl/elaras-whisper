@@ -18,6 +18,7 @@ const state = {
   dragging: false,
   working: false,
   downloadUrl: null,
+  previewUrl: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -293,7 +294,7 @@ function initDial() {
     } else if (e.key === "Home") {
       setIntensity(0);
     } else if (e.key === "End") {
-      setIntensity(1);
+      setIntensity(1.2);
     }
   });
 
@@ -326,40 +327,59 @@ function renderFiles() {
 
   if (!state.files.length) {
     list.hidden = true;
-    list.innerHTML = "";
+    list.replaceChildren();
     zone.classList.remove("has-files");
     btn.disabled = true;
+    const detectBtn = document.getElementById("detect-bpm-btn");
+    const previewBtn = document.getElementById("preview-btn");
+    if (detectBtn) detectBtn.disabled = true;
+    if (previewBtn) previewBtn.disabled = true;
     return;
   }
 
   zone.classList.add("has-files");
   list.hidden = false;
-  list.innerHTML = "";
+  list.replaceChildren();
+  const detectBtn = document.getElementById("detect-bpm-btn");
+  const previewBtn = document.getElementById("preview-btn");
+  if (detectBtn) detectBtn.disabled = state.working || !state.files.length;
+  if (previewBtn) previewBtn.disabled = state.working || !state.files.length;
   state.files.forEach((file, i) => {
     const li = document.createElement("li");
-    li.innerHTML = `
-      <span class="dot"></span>
-      <span class="name" title="${file.name}">${file.name}</span>
-      <span class="size">${formatSize(file.size)}</span>
-      <button type="button" aria-label="Remove ${file.name}" data-i="${i}">×</button>
-    `;
-    list.appendChild(li);
-  });
-  list.querySelectorAll("button").forEach((b) => {
-    b.addEventListener("click", (e) => {
+
+    const dot = document.createElement("span");
+    dot.className = "dot";
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.title = file.name;
+    name.textContent = file.name;
+
+    const size = document.createElement("span");
+    size.className = "size";
+    size.textContent = formatSize(file.size);
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.dataset.i = String(i);
+    remove.setAttribute("aria-label", `Remove ${file.name}`);
+    remove.textContent = "×";
+    remove.addEventListener("click", (e) => {
       e.stopPropagation();
-      state.files.splice(parseInt(b.dataset.i, 10), 1);
+      state.files.splice(i, 1);
       renderFiles();
     });
+
+    li.append(dot, name, size, remove);
+    list.appendChild(li);
   });
   btn.disabled = state.working;
 }
 
 function addFiles(fileList) {
+  // Match server allow-list (extension only — avoid accepting webm/m4a as audio/*)
   const allowed = /\.(wav|flac|ogg|aiff|aif|mp3|caf)$/i;
-  const incoming = Array.from(fileList || []).filter(
-    (f) => allowed.test(f.name) || (f.type && f.type.startsWith("audio/"))
-  );
+  const incoming = Array.from(fileList || []).filter((f) => allowed.test(f.name));
   for (const f of incoming) {
     if (!state.files.some((x) => x.name === f.name && x.size === f.size)) {
       state.files.push(f);
@@ -468,14 +488,153 @@ function setStatus(msg, kind = "") {
   el.className = "status" + (kind ? ` ${kind}` : "");
 }
 
+function appendFormParams(fd, { includePreviewSeconds = false, forPreview = false } = {}) {
+  fd.append("intensity", String(state.intensity));
+  fd.append("haze_hz", String(document.getElementById("haze").value || 6000));
+  const seed = document.getElementById("seed").value;
+  if (seed !== "") fd.append("seed", seed);
+
+  const sourceBpm = document.getElementById("source-bpm").value.trim();
+  const targetBpm = document.getElementById("target-bpm").value.trim();
+  const tempoRate = document.getElementById("tempo-rate").value.trim();
+  if (sourceBpm) fd.append("source_bpm", sourceBpm);
+  if (tempoRate) {
+    fd.append("tempo_rate", tempoRate);
+  } else if (targetBpm) {
+    fd.append("target_bpm", targetBpm);
+  }
+
+  const prev = document.getElementById("preview-seconds").value.trim();
+  if (forPreview) {
+    fd.append("preview_seconds", prev || "10");
+  } else if (includePreviewSeconds && prev) {
+    // Full export ignores preview unless user deliberately wants a short file —
+    // we do not send preview_seconds on full process.
+  }
+}
+
+function setTempoStatus(msg, kind = "") {
+  const el = document.getElementById("tempo-status");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.className = "tempo-status" + (kind ? ` ${kind}` : "");
+}
+
+function setWorkingUi(working, label) {
+  state.working = working;
+  const btn = document.getElementById("whisper-btn");
+  const detectBtn = document.getElementById("detect-bpm-btn");
+  const previewBtn = document.getElementById("preview-btn");
+  if (working) {
+    btn.disabled = true;
+    btn.classList.add("working");
+    if (label) btn.querySelector(".btn-label").textContent = label;
+    if (detectBtn) detectBtn.disabled = true;
+    if (previewBtn) previewBtn.disabled = true;
+  } else {
+    btn.classList.remove("working");
+    btn.querySelector(".btn-label").textContent = "Unbind the glass eye";
+    btn.disabled = !state.files.length;
+    if (detectBtn) detectBtn.disabled = !state.files.length;
+    if (previewBtn) previewBtn.disabled = !state.files.length;
+  }
+}
+
+async function detectBpm() {
+  if (state.working || !state.files.length) return;
+  setWorkingUi(true, "Listening for the pulse…");
+  setTempoStatus("Detecting BPM…");
+  setStatus("Detecting source BPM…");
+
+  const fd = new FormData();
+  fd.append("files", state.files[0], state.files[0].name);
+
+  try {
+    const res = await fetch("/api/detect-bpm", { method: "POST", body: fd });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
+    document.getElementById("source-bpm").value = String(j.bpm);
+    setTempoStatus(
+      `Detected ${j.bpm} BPM · ${j.duration_sec}s · ${j.filename}`,
+      "ok"
+    );
+    setStatus(`Source BPM ≈ ${j.bpm}`, "ok");
+  } catch (err) {
+    setTempoStatus(err.message || String(err), "error");
+    setStatus(err.message || String(err), "error");
+  } finally {
+    setWorkingUi(false);
+  }
+}
+
+async function runPreview() {
+  if (state.working || !state.files.length) return;
+  setWorkingUi(true, "Weaving a short breath…");
+  setStatus("Building preview (first seconds + tempo + whisper)…");
+  setTempoStatus("Rendering preview…");
+
+  if (state.previewUrl) {
+    URL.revokeObjectURL(state.previewUrl);
+    state.previewUrl = null;
+  }
+
+  const fd = new FormData();
+  fd.append("files", state.files[0], state.files[0].name);
+  appendFormParams(fd, { forPreview: true });
+
+  try {
+    const res = await fetch("/api/preview", { method: "POST", body: fd });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const j = await res.json();
+        detail = j.error || detail;
+      } catch (_) {
+        /* ignore */
+      }
+      throw new Error(detail);
+    }
+
+    const blob = await res.blob();
+    state.previewUrl = URL.createObjectURL(blob);
+    const player = document.getElementById("preview-player");
+    player.src = state.previewUrl;
+    player.hidden = false;
+    player.load();
+    try {
+      await player.play();
+    } catch (_) {
+      /* autoplay may be blocked — controls still work */
+    }
+
+    const srcB = res.headers.get("X-Source-Bpm");
+    const tgtB = res.headers.get("X-Target-Bpm");
+    const rate = res.headers.get("X-Tempo-Rate");
+    const prevS = res.headers.get("X-Preview-Seconds") || "10";
+    const applied = res.headers.get("X-Tempo-Applied") === "1";
+    let tempoLine = `Preview · first ${prevS}s`;
+    if (applied && srcB && tgtB) {
+      tempoLine += ` · ${srcB} → ${tgtB} BPM (×${rate})`;
+      if (!document.getElementById("source-bpm").value && srcB) {
+        document.getElementById("source-bpm").value = srcB;
+      }
+    } else if (srcB) {
+      tempoLine += ` · source ~${srcB} BPM`;
+    }
+    setTempoStatus(tempoLine, "ok");
+    setStatus("Preview ready — listen, then unbind the full track.", "ok");
+  } catch (err) {
+    setTempoStatus(err.message || String(err), "error");
+    setStatus(err.message || String(err), "error");
+  } finally {
+    setWorkingUi(false);
+  }
+}
+
 async function runWhisper() {
   if (state.working || !state.files.length) return;
 
-  state.working = true;
-  const btn = document.getElementById("whisper-btn");
-  btn.disabled = true;
-  btn.classList.add("working");
-  btn.querySelector(".btn-label").textContent = "The loom is breathing…";
+  setWorkingUi(true, "The loom is breathing…");
   setStatus("Spectral unstitching in progress…");
   document.getElementById("result").hidden = true;
 
@@ -488,10 +647,7 @@ async function runWhisper() {
 
   const fd = new FormData();
   state.files.forEach((f) => fd.append("files", f, f.name));
-  fd.append("intensity", String(state.intensity));
-  fd.append("haze_hz", String(document.getElementById("haze").value || 6000));
-  const seed = document.getElementById("seed").value;
-  if (seed !== "") fd.append("seed", seed);
+  appendFormParams(fd, { forPreview: false });
 
   try {
     const res = await fetch("/api/process", { method: "POST", body: fd });
@@ -518,8 +674,14 @@ async function runWhisper() {
     const link = document.getElementById("download-link");
     link.href = state.downloadUrl;
     link.download = filename;
-    document.getElementById("result-meta").textContent =
+
+    const targetBpm = document.getElementById("target-bpm").value.trim();
+    const tempoRate = document.getElementById("tempo-rate").value.trim();
+    let meta =
       `${filename} · intensity ${state.intensity.toFixed(2)} · ${state.files.length} source(s)`;
+    if (tempoRate) meta += ` · rate ×${tempoRate}`;
+    else if (targetBpm) meta += ` · → ${targetBpm} BPM`;
+    document.getElementById("result-meta").textContent = meta;
     document.getElementById("result").hidden = false;
     setStages("done");
     setStatus("The glass eye softens.", "ok");
@@ -528,10 +690,7 @@ async function runWhisper() {
     setStages("idle");
     setStatus(err.message || String(err), "error");
   } finally {
-    state.working = false;
-    btn.classList.remove("working");
-    btn.querySelector(".btn-label").textContent = "Unbind the glass eye";
-    btn.disabled = !state.files.length;
+    setWorkingUi(false);
   }
 }
 
@@ -545,11 +704,18 @@ function boot() {
   initDropzone();
   setIntensity(0.45);
   document.getElementById("whisper-btn").addEventListener("click", runWhisper);
+  document.getElementById("detect-bpm-btn").addEventListener("click", detectBpm);
+  document.getElementById("preview-btn").addEventListener("click", runPreview);
 
-  fetch("/api/presets")
+  fetch("/api/health")
     .then((r) => r.json())
-    .then(() => setStatus("Loom ready. Lay a track upon the glass."))
-    .catch(() => setStatus("Loom ready (offline presets)."));
+    .then((h) => {
+      if (h.tempo === false) {
+        setTempoStatus("librosa not found — install for BPM adjust", "error");
+      }
+      setStatus("Loom ready. Lay a track upon the glass.");
+    })
+    .catch(() => setStatus("Loom ready. Lay a track upon the glass."));
 }
 
 boot();

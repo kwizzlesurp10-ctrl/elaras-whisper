@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "elaras-whisper"
-version = "0.2.0"
-description = "Elara's Whisper — softens machine-spun tracks with spectral breath, air, micro-dynamics, and gentle warmth."
+version = "0.3.0"
+description = "Elara's Whisper — softens machine-spun tracks with spectral breath, air, micro-dynamics, gentle warmth, and open-source BPM adjust."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -40,7 +40,9 @@ dependencies = [
 
 [project.optional-dependencies]
 ui = ["flask>=3.0"]
-dev = ["pytest>=7.0", "flask>=3.0"]
+tempo = ["librosa>=0.10"]
+all = ["flask>=3.0", "librosa>=0.10"]
+dev = ["pytest>=7.0", "flask>=3.0", "librosa>=0.10"]
 
 [project.scripts]
 elaras-whisper = "elaras_whisper:main"

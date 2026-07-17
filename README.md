@@ -57,8 +57,27 @@ Opens at [http://127.0.0.1:8787/](http://127.0.0.1:8787/) by default (`--host` /
 | Memory seed | Reproducible RNG |
 | Haze from | Spectral unstitch / air floor (Hz) |
 | **Unbind the glass eye** | Run the four-stage loom |
+| **Tempo loom** | Detect BPM, set target BPM or rate (librosa phase vocoder) |
+| **Preview** | Process first N seconds + play in-page before full export |
 
-Requires optional dep: `flask` (`pip install flask` or `.[ui]`).
+Requires optional dep: `flask` (`pip install flask` or `.[ui]`).  
+BPM adjust: `librosa` (`pip install librosa` or `.[tempo]` / `.[all]`).
+
+### BPM / preview (CLI)
+
+```bash
+# estimate tempo
+python3 elaras_whisper.py track.wav --detect-bpm
+
+# stretch to target BPM (auto-detect source), then whisper
+python3 elaras_whisper.py track.wav --bpm 128 -o out.wav
+
+# explicit rate (1.05 = 5% faster), pitch preserved
+python3 elaras_whisper.py track.wav --tempo-rate 1.05 -o out.wav
+
+# quick A/B: first 10 seconds only
+python3 elaras_whisper.py track.wav --bpm 120 --preview-seconds 10 -o preview.wav
+```
 
 ## Usage (CLI)
 

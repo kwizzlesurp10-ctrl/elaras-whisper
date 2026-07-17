@@ -47,6 +47,8 @@ N_FFT = 2048
 HOP = 512
 DEFAULT_INTENSITY = 0.45
 SUPPORTED_EXTS = {".wav", ".flac", ".ogg", ".aiff", ".aif", ".mp3", ".caf"}
+# filtfilt / envelope stages need a few dozen samples; shorter clips pass through
+MIN_PROCESS_SAMPLES = 64
 
 # Named intensity stops for A/B and muscle-memory
 PRESETS: Dict[str, float] = {
@@ -160,7 +162,9 @@ def spectral_unstitch(
     )
     # Frequency-dependent weight: higher bins get a touch more
     f_w = np.linspace(0.7, 1.3, n_haze)
-    mag[:, haze_bins] *= 1.0 + mag_depth * breath * f_w
+    # Clamp scale so magnitude never inverts or collapses to zero
+    scale = 1.0 + mag_depth * breath * f_w
+    mag[:, haze_bins] *= np.clip(scale, 1e-3, None)
 
     # Phase jitter: tiny living wander (radians)
     phase_depth = 0.02 + 0.08 * intensity  # ~0.056 rad at 0.45
@@ -198,10 +202,10 @@ def organic_texture(
     A whisper of high-frequency air — not mud, not noise for its own sake.
     Envelope-followed so it sits with the track like faint room tone / tape grain.
     """
-    if intensity <= 0.0:
+    n = len(x)
+    if intensity <= 0.0 or n < MIN_PROCESS_SAMPLES:
         return x.copy()
 
-    n = len(x)
     # Slightly pink-ish source: white filtered toward 1/f via cumulative integration
     white = rng.normal(0.0, 1.0, size=n)
     # Crude pink: mix white with integrated (brown-ish) white
@@ -215,6 +219,10 @@ def organic_texture(
     high = min(14000.0, sr * 0.48)
     low = min(haze_hz * 0.9, high * 0.5)
     b, a = _design_bandpass(sr, low, high, order=3)
+    # filtfilt needs length > padlen (~3 * max(len(a), len(b)))
+    padlen = 3 * max(len(a), len(b))
+    if n <= padlen:
+        return x.copy()
     air = sps.filtfilt(b, a, grain)
 
     # Envelope from the signal itself (slow follower) so air rides with energy
@@ -251,10 +259,10 @@ def micro_dynamics(
     Across variable, non-uniform windows the amplitude hesitates, swells
     a fraction, pulls back. Nothing stays perfectly level.
     """
-    if intensity <= 0.0:
+    n = len(x)
+    if intensity <= 0.0 or n < 1:
         return x.copy()
 
-    n = len(x)
     # Build a gain curve from irregular segments
     gain = np.ones(n, dtype=np.float64)
     # Depth of modulation: ~1–2% at 0.45, up to ~5% at 1.0
@@ -303,7 +311,7 @@ def gentle_warmth(x: np.ndarray, intensity: float) -> np.ndarray:
     Soft analog bloom: gentle soft-clip harmonics + a whisper of even-order
     body, blended so the original soul is not crushed.
     """
-    if intensity <= 0.0:
+    if intensity <= 0.0 or len(x) < 1:
         return x.copy()
 
     # Drive scales gently with intensity
@@ -332,6 +340,185 @@ def gentle_warmth(x: np.ndarray, intensity: float) -> np.ndarray:
     if peak > 1.0:
         out = out * (0.98 / peak)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Tempo / BPM — open-source phase vocoder (librosa)
+# ---------------------------------------------------------------------------
+
+MIN_TEMPO_RATE = 0.5
+MAX_TEMPO_RATE = 2.0
+DEFAULT_PREVIEW_SECONDS = 10.0
+
+
+def _require_librosa():
+    """librosa: ISC license — beat tracking + phase-vocoder time stretch."""
+    try:
+        import librosa  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "BPM adjust needs librosa (open-source).\n"
+            "  pip install librosa\n"
+            "  # or:  pip install -e '.[tempo]'"
+        ) from e
+    return librosa
+
+
+def detect_bpm(audio: np.ndarray, sr: int) -> float:
+    """
+    Estimate global tempo (BPM) with librosa.beat.beat_track.
+    Returns 0.0 if estimation fails.
+    """
+    librosa = _require_librosa()
+    y = np.asarray(audio, dtype=np.float64)
+    if y.ndim == 2:
+        y = np.mean(y, axis=1)
+    if y.size < max(256, int(0.25 * sr)):
+        return 0.0
+    # float32 is what librosa expects for speed
+    tempo, _ = librosa.beat.beat_track(y=y.astype(np.float32), sr=int(sr))
+    tempo_arr = np.atleast_1d(np.asarray(tempo, dtype=np.float64))
+    if tempo_arr.size == 0 or not np.isfinite(tempo_arr[0]) or tempo_arr[0] <= 0:
+        return 0.0
+    return float(tempo_arr[0])
+
+
+def time_stretch(audio: np.ndarray, rate: float) -> np.ndarray:
+    """
+    Pitch-preserving time stretch. rate > 1 → faster (higher BPM, shorter).
+    Uses librosa.effects.time_stretch (phase vocoder).
+    """
+    rate = float(rate)
+    if abs(rate - 1.0) < 1e-4:
+        return np.asarray(audio, dtype=np.float64).copy()
+    if rate <= 0:
+        raise ValueError("tempo rate must be positive")
+
+    librosa = _require_librosa()
+    mono_in = np.asarray(audio).ndim == 1
+    x = audio[:, np.newaxis] if mono_in else np.asarray(audio)
+    x = x.astype(np.float64, copy=False)
+
+    channels = []
+    for ch in range(x.shape[1]):
+        y = librosa.effects.time_stretch(
+            x[:, ch].astype(np.float32), rate=rate
+        ).astype(np.float64)
+        channels.append(y)
+    n = min(len(c) for c in channels)
+    out = np.stack([c[:n] for c in channels], axis=1)
+    return out[:, 0] if mono_in else out
+
+
+def apply_tempo(
+    audio: np.ndarray,
+    sr: int,
+    *,
+    target_bpm: Optional[float] = None,
+    source_bpm: Optional[float] = None,
+    rate: Optional[float] = None,
+) -> Tuple[np.ndarray, dict]:
+    """
+    Adjust tempo toward a target BPM (or by explicit rate).
+
+    Returns (audio_out, meta) where meta includes source_bpm, target_bpm, rate, applied.
+    """
+    meta: dict = {
+        "source_bpm": None,
+        "target_bpm": None,
+        "rate": 1.0,
+        "applied": False,
+    }
+
+    if rate is None and target_bpm is None:
+        return np.asarray(audio, dtype=np.float64).copy(), meta
+
+    src = float(source_bpm) if source_bpm is not None and float(source_bpm) > 0 else None
+    if rate is None:
+        if src is None:
+            src = detect_bpm(audio, sr)
+        meta["source_bpm"] = src if src and src > 0 else None
+        if not src or src <= 0:
+            meta["warning"] = "could not detect source BPM"
+            return np.asarray(audio, dtype=np.float64).copy(), meta
+        tgt = float(target_bpm)
+        if tgt <= 0:
+            raise ValueError("target BPM must be positive")
+        rate = tgt / src
+        meta["target_bpm"] = tgt
+    else:
+        rate = float(rate)
+        if src is None:
+            try:
+                src = detect_bpm(audio, sr)
+            except ImportError:
+                src = None
+        meta["source_bpm"] = src
+        if src and src > 0:
+            meta["target_bpm"] = src * rate
+        elif target_bpm is not None:
+            meta["target_bpm"] = float(target_bpm)
+
+    rate = float(np.clip(rate, MIN_TEMPO_RATE, MAX_TEMPO_RATE))
+    meta["rate"] = rate
+    if abs(rate - 1.0) < 1e-4:
+        return np.asarray(audio, dtype=np.float64).copy(), meta
+
+    stretched = time_stretch(audio, rate)
+    meta["applied"] = True
+    return stretched, meta
+
+
+def slice_preview(
+    audio: np.ndarray, sr: int, seconds: float = DEFAULT_PREVIEW_SECONDS
+) -> np.ndarray:
+    """First N seconds for quick A/B (preview)."""
+    seconds = float(seconds)
+    if seconds <= 0:
+        return np.asarray(audio, dtype=np.float64).copy()
+    n = int(seconds * sr)
+    x = np.asarray(audio)
+    if n <= 0 or n >= x.shape[0]:
+        return x.astype(np.float64, copy=True)
+    if x.ndim == 1:
+        return x[:n].astype(np.float64, copy=True)
+    return x[:n, :].astype(np.float64, copy=True)
+
+
+def process_audio(
+    audio: np.ndarray,
+    sr: int,
+    *,
+    intensity: float = DEFAULT_INTENSITY,
+    seed: Optional[int] = None,
+    haze_hz: float = HAZE_HZ,
+    target_bpm: Optional[float] = None,
+    source_bpm: Optional[float] = None,
+    tempo_rate: Optional[float] = None,
+    preview_seconds: Optional[float] = None,
+) -> Tuple[np.ndarray, dict]:
+    """
+    Full loom path: optional preview slice → tempo → whisper.
+    Returns (audio_out, meta) with tempo keys when used.
+    """
+    meta: dict = {}
+    y = np.asarray(audio, dtype=np.float64)
+    if preview_seconds is not None and float(preview_seconds) > 0:
+        y = slice_preview(y, sr, float(preview_seconds))
+        meta["preview_seconds"] = float(preview_seconds)
+        meta["preview_samples"] = int(y.shape[0])
+
+    y, tmeta = apply_tempo(
+        y,
+        sr,
+        target_bpm=target_bpm,
+        source_bpm=source_bpm,
+        rate=tempo_rate,
+    )
+    meta.update(tmeta)
+
+    y = whisper(y, sr, intensity=intensity, seed=seed, haze_hz=haze_hz)
+    return y, meta
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +551,9 @@ def whisper(
         audio = audio[:, np.newaxis]
 
     n_samples, n_ch = audio.shape
+    if n_samples == 0:
+        return audio[:, 0].copy() if mono_in else audio.copy()
+
     out = np.zeros_like(audio, dtype=np.float64)
 
     for ch in range(n_ch):
@@ -461,6 +651,7 @@ def output_as_directory(
     if p.is_dir():
         return True
     # Trailing separator signals directory intent even if path does not exist yet
+    # (argparse Path often strips it; bare names without suffix still count as dirs)
     if str(output).endswith(("/", "\\")):
         return True
     if p.is_file():
@@ -474,11 +665,67 @@ def output_as_directory(
     return False
 
 
+def validate_batch_output_dir(output: Optional[Path]) -> None:
+    """
+    For multi/batch mode, -o must be a directory (or omitted).
+    Reject existing files and non-existent paths that look like audio files
+    (e.g. -o out.wav would otherwise mkdir a folder literally named out.wav).
+    """
+    if output is None:
+        return
+    out = output.expanduser()
+    if out.is_file():
+        raise ValueError(
+            "for batch/multi inputs, -o must be a directory, not a file"
+        )
+    if out.is_dir():
+        return
+    # Path does not exist yet
+    if out.suffix.lower() in SUPPORTED_EXTS:
+        raise ValueError(
+            f"for batch/multi inputs, -o must be a directory, not a file path "
+            f"({out.name!r} looks like audio). Use a folder, e.g. ./softened/"
+        )
+
+
+def batch_output_stem(src: Path, sources: Sequence[Path]) -> str:
+    """
+    Prefer plain stem; if multiple sources share a stem, prefix with parent
+    folder name to avoid silent clobber (dirA/x.wav + dirB/x.wav).
+    """
+    stem = src.stem
+    same = [s for s in sources if s.stem == stem]
+    if len(same) <= 1:
+        return stem
+    parent = src.parent.name or "track"
+    return f"{parent}__{stem}"
+
+
+def unique_in_dir(
+    out_dir: Path,
+    stem: str,
+    suffix: str,
+    used: set,
+) -> Path:
+    """Pick a unique filename inside out_dir, tracking names already claimed."""
+    suffix = suffix or ".wav"
+    base = f"{stem}__elaras_whisper{suffix}"
+    n = 1
+    name = base
+    while name in used or (out_dir / name).exists():
+        n += 1
+        name = f"{stem}__elaras_whisper_{n}{suffix}"
+    used.add(name)
+    return out_dir / name
+
+
 def resolve_output_path(
     src: Path,
     output: Optional[Path],
     *,
     as_directory: bool,
+    sources: Optional[Sequence[Path]] = None,
+    used_names: Optional[set] = None,
 ) -> Path:
     """
     Single file: -o is a file path (or default stem suffix).
@@ -491,7 +738,11 @@ def resolve_output_path(
             else (src.parent / "elaras_whisper_out")
         )
         out_dir.mkdir(parents=True, exist_ok=True)
-        return out_dir / f"{src.stem}__elaras_whisper{src.suffix or '.wav'}"
+        stem = batch_output_stem(src, sources or [src])
+        suffix = src.suffix or ".wav"
+        if used_names is not None:
+            return unique_in_dir(out_dir, stem, suffix, used_names)
+        return out_dir / f"{stem}__elaras_whisper{suffix}"
 
     if output is not None:
         return output.expanduser().resolve()
@@ -505,6 +756,11 @@ def process_file(
     seed: Optional[int],
     haze_hz: float,
     quiet: bool = False,
+    *,
+    target_bpm: Optional[float] = None,
+    source_bpm: Optional[float] = None,
+    tempo_rate: Optional[float] = None,
+    preview_seconds: Optional[float] = None,
 ) -> int:
     """Process one file. Returns 0 on success, 1 on failure."""
     if src.suffix.lower() not in SUPPORTED_EXTS:
@@ -528,16 +784,30 @@ def process_file(
         print(f"     loaded:  {dur:.2f}s · {sr} Hz · {n_ch} ch")
 
     try:
-        result = whisper(
+        result, meta = process_audio(
             audio,
             sr,
             intensity=intensity,
             seed=seed,
             haze_hz=haze_hz,
+            target_bpm=target_bpm,
+            source_bpm=source_bpm,
+            tempo_rate=tempo_rate,
+            preview_seconds=preview_seconds,
         )
     except Exception as e:
         print(f"error: processing failed for {src}: {e}", file=sys.stderr)
         return 1
+
+    if not quiet and meta.get("applied"):
+        src_b = meta.get("source_bpm")
+        tgt_b = meta.get("target_bpm")
+        rate = meta.get("rate", 1.0)
+        src_s = f"{src_b:.1f}" if isinstance(src_b, (int, float)) and src_b else "?"
+        tgt_s = f"{tgt_b:.1f}" if isinstance(tgt_b, (int, float)) and tgt_b else "?"
+        print(f"     tempo:   {src_s} → {tgt_s} BPM  (×{rate:.4f})")
+    if not quiet and meta.get("preview_seconds"):
+        print(f"     preview: first {meta['preview_seconds']:g}s only")
 
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -579,6 +849,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  elaras_whisper a.wav b.wav -o ./softened/\n"
             "  elaras_whisper --batch ./suno_exports --preset fluff\n"
             "  elaras_whisper --batch ./album -r -o ./album_whispered/\n"
+            "  elaras_whisper track.wav --bpm 128 -o out.wav\n"
+            "  elaras_whisper track.wav --bpm 120 --preview-seconds 10\n"
+            "  elaras_whisper track.wav --detect-bpm\n"
             "  elaras_whisper --gui\n"
         ),
     )
@@ -645,6 +918,39 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Frequency where spectral unstitching begins (default: {HAZE_HZ})",
     )
     p.add_argument(
+        "--bpm",
+        type=float,
+        default=None,
+        metavar="TARGET",
+        help="Target BPM (open-source librosa time-stretch; auto-detects source)",
+    )
+    p.add_argument(
+        "--source-bpm",
+        type=float,
+        default=None,
+        metavar="BPM",
+        help="Override detected source BPM when using --bpm",
+    )
+    p.add_argument(
+        "--tempo-rate",
+        type=float,
+        default=None,
+        metavar="RATE",
+        help=f"Explicit tempo rate {MIN_TEMPO_RATE}–{MAX_TEMPO_RATE} (1.0 = unchanged; overrides --bpm)",
+    )
+    p.add_argument(
+        "--preview-seconds",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Process only the first SEC seconds (quick A/B preview)",
+    )
+    p.add_argument(
+        "--detect-bpm",
+        action="store_true",
+        help="Print estimated BPM for each input and exit (no processing)",
+    )
+    p.add_argument(
         "-q",
         "--quiet",
         action="store_true",
@@ -684,12 +990,6 @@ def main(argv: Optional[list] = None) -> int:
         build_parser().error("provide at least one input path, --batch DIR, or --gui")
 
     try:
-        intensity = resolve_intensity(args.intensity, args.preset)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-
-    try:
         sources = collect_inputs(args.inputs, args.batch, recursive=args.recursive)
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -699,19 +999,67 @@ def main(argv: Optional[list] = None) -> int:
         print("error: no supported audio files found", file=sys.stderr)
         return 1
 
+    if args.detect_bpm:
+        try:
+            _require_librosa()
+        except ImportError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        for src in sources:
+            try:
+                audio, sr = load_audio(src)
+                bpm = detect_bpm(audio, sr)
+            except Exception as e:
+                print(f"{src.name}: error ({e})", file=sys.stderr)
+                continue
+            if bpm > 0:
+                print(f"{src.name}: {bpm:.2f} BPM")
+            else:
+                print(f"{src.name}: could not detect BPM")
+        return 0
+
+    try:
+        intensity = resolve_intensity(args.intensity, args.preset)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    if args.tempo_rate is not None and (
+        args.tempo_rate < MIN_TEMPO_RATE or args.tempo_rate > MAX_TEMPO_RATE
+    ):
+        print(
+            f"error: --tempo-rate must be between {MIN_TEMPO_RATE} and {MAX_TEMPO_RATE}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.bpm is not None and args.bpm <= 0:
+        print("error: --bpm must be positive", file=sys.stderr)
+        return 1
+
+    # tempo_rate wins over --bpm when both given
+    tempo_rate = args.tempo_rate
+    target_bpm = None if tempo_rate is not None else args.bpm
+    source_bpm = args.source_bpm
+    preview_seconds = args.preview_seconds
+
+    if target_bpm is not None or tempo_rate is not None:
+        try:
+            _require_librosa()
+        except ImportError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+
     multi = len(sources) > 1
     # --batch always writes into a directory (even for a single match)
     force_dir = bool(args.batch)
     as_directory = output_as_directory(
         args.output, multi=multi, force_dir=force_dir
     )
-    if as_directory and args.output is not None:
-        out = args.output.expanduser()
-        if out.is_file():
-            print(
-                "error: for batch/multi inputs, -o must be a directory, not a file",
-                file=sys.stderr,
-            )
+    if as_directory:
+        try:
+            validate_batch_output_dir(args.output)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
             return 1
 
     if not args.quiet:
@@ -724,11 +1072,23 @@ def main(argv: Optional[list] = None) -> int:
         if args.seed is not None:
             print(f"  seed:       {args.seed}")
         print(f"  haze from:  {args.haze_hz:.0f} Hz")
+        if tempo_rate is not None:
+            print(f"  tempo rate: ×{tempo_rate:g}")
+        elif target_bpm is not None:
+            src_note = f" (source override {source_bpm:g})" if source_bpm else " (auto-detect source)"
+            print(f"  target BPM: {target_bpm:g}{src_note}")
+        if preview_seconds is not None:
+            print(f"  preview:    first {preview_seconds:g}s")
 
     failures = 0
+    used_names: set = set()
     for src in sources:
         out_path = resolve_output_path(
-            src, args.output, as_directory=as_directory
+            src,
+            args.output,
+            as_directory=as_directory,
+            sources=sources,
+            used_names=used_names if as_directory else None,
         )
         rc = process_file(
             src,
@@ -737,9 +1097,12 @@ def main(argv: Optional[list] = None) -> int:
             seed=args.seed,
             haze_hz=float(args.haze_hz),
             quiet=args.quiet,
+            target_bpm=target_bpm,
+            source_bpm=source_bpm,
+            tempo_rate=tempo_rate,
+            preview_seconds=preview_seconds,
         )
         failures += rc
-
     if not args.quiet:
         if failures:
             print(f"  done with {failures} failure(s).")

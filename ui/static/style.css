@@ -350,6 +350,96 @@ body {
   border-color: var(--teal);
 }
 
+/* Tempo / BPM panel */
+.tempo-panel {
+  margin-top: 1.15rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--stroke);
+}
+
+.tempo-note {
+  margin: 0 0 0.85rem;
+  font-size: 0.92rem;
+  font-style: italic;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.tempo-note strong {
+  color: var(--teal);
+  font-style: normal;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+
+.tempo-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.85rem;
+}
+
+.ghost-btn {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--gold-soft);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 999px;
+  padding: 0.55rem 0.75rem;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s, box-shadow 0.2s, opacity 0.2s;
+}
+
+.ghost-btn:hover:not(:disabled) {
+  border-color: var(--gold);
+  box-shadow: 0 0 16px rgba(201, 162, 39, 0.2);
+}
+
+.ghost-btn-teal {
+  color: var(--teal);
+  border-color: rgba(94, 234, 212, 0.35);
+}
+
+.ghost-btn-teal:hover:not(:disabled) {
+  border-color: var(--teal);
+  box-shadow: 0 0 16px rgba(94, 234, 212, 0.2);
+}
+
+.ghost-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.tempo-status {
+  min-height: 1.2em;
+  margin: 0.65rem 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted);
+  letter-spacing: 0.03em;
+}
+
+.tempo-status.ok {
+  color: var(--teal);
+}
+
+.tempo-status.error {
+  color: var(--danger);
+}
+
+.preview-player {
+  width: 100%;
+  margin-top: 0.75rem;
+  height: 36px;
+  border-radius: 8px;
+  outline: none;
+  accent-color: var(--teal);
+}
+
 /* Dial */
 .dial-panel {
   display: flex;
